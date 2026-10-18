@@ -5,7 +5,7 @@ Spend model attention on implementation and judgment. Move repeated, determinist
 ## Keep enforcement cheap
 
 - **Use runnable checks.** External command execution does not itself require model inference. The agent still spends context on the command, returned output, failure interpretation, and evidence review.
-- **Cap evidence.** Store the resolved environment facts and decisive output, not a full build log.
+- **Cap evidence.** Store resolved environment facts plus the automatic output fingerprint, never raw successful output or a full build log.
 - **Keep the Stop hook scan-only.** The hook itself does not call a model. A block causes another agent continuation, which does consume model work, so keep the six-block no-progress guard and make each block actionable.
 - **Use sequential checks by default.** Raise `--jobs` only for independent checks when wall-clock savings justify harder failure diagnosis.
 
@@ -14,19 +14,28 @@ Spend model attention on implementation and judgment. Move repeated, determinist
 - Give a leaf the shared contract and its own ledger, not the driver's transcript or unrelated leaf outputs.
 - Keep `SKILL.md` limited to the core workflow. Load method, gate, orchestration, and parallel references only when the selected mode needs them.
 - Append events to `status.log`. Do not repeatedly regenerate a large plan when one line records the event.
-- Summarize a long command result into decisive evidence while retaining the full log outside the prompt when debugging needs it.
+- Keep failure logs local and summarize only non-sensitive decisive facts when a manual report needs them; automatic success evidence already contains a digest and byte count.
 
-## Spend stronger reasoning on leverage points
+## Mark leaf reasoning needs without inventing host controls
 
-Use the strongest available review for:
+`Tier` is planner metadata for execution leaves, not a model name or a routing
+guarantee:
 
-- contracts and architecture
-- security and compatibility boundaries
-- branch integration
-- manual high-risk gates
-- parent re-verification and final claim audit
+- Use `judgment` when the leaf's own artifact needs design, security or
+  compatibility reasoning, consequential manual review, or non-mechanical
+  verification.
+- Use `mechanical` only when the transformation pattern and acceptance gates are
+  already fixed.
 
-Use lower-cost execution for mechanical transformations only after the pattern and acceptance gates are fixed.
+If the host exposes a documented model or reasoning control, the driver may map
+these tiers through that host-specific control at launch. If no such control is
+available, retain the tier as a briefing and review requirement and do not claim
+that a particular model or reasoning level was selected.
+
+Driver and branch duties are not leaf tiers. Contract and architecture work,
+dispatch decisions, parent re-verification, branch integration, and the final
+claim audit remain judgment responsibilities even when every execution leaf is
+mechanical.
 
 ## Avoid false economy
 

@@ -8,7 +8,7 @@
 // Prints "N/N passed" on success, which is the string CI and the repo's own
 // gates match on.
 
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -181,13 +181,72 @@ test("state: checked box with pending evidence counts as unmet", async () => {
   } finally { s.cleanup(); }
 });
 
-test("state: ABANDON resolves a gate honestly", async () => {
+test("state: ABANDON is a non-success handoff, not completion", async () => {
   const s = sandbox();
   try {
     s.write("GATES.md", "# Gates\n\n- [ ] G1: impossible\n  EVIDENCE: pending\n\nABANDON: G1 upstream API removed\n");
     const r = await run(GATE_CHECK, ["--status"], { cwd: s.dir });
-    assert(r.code === 0, "expected exit 0, got " + r.code);
-    assertHas(r.out, "1 abandoned");
+    assert(r.code === 1, "expected exit 1, got " + r.code);
+    assertHas(r.out, "HANDOFF REQUIRED: 1 abandoned");
+    assertLacks(r.out, "ALL MET");
+  } finally { s.cleanup(); }
+});
+
+test("state: abandoned and mixed ledgers stay handoffs in every run mode", async () => {
+  for (const args of [["--status"], [], ["--reverify"]]) {
+    const s = sandbox();
+    try {
+      s.write("GATES.md", [
+        "# Gates",
+        "",
+        "- [x] G1: measured outcome",
+        "  EVIDENCE: checked by test",
+        "",
+        "- [ ] G2: impossible outcome",
+        "  EVIDENCE: pending",
+        "",
+        "ABANDON: G2 upstream API removed",
+        "",
+      ].join("\n"));
+      const r = await run(GATE_CHECK, args, { cwd: s.dir });
+      assert(r.code === 1, "expected exit 1 for " + JSON.stringify(args) + ", got " + r.code + "\n" + r.out);
+      assertHas(r.out, "HANDOFF REQUIRED: 1 abandoned");
+      assertLacks(r.out, "ALL MET");
+    } finally { s.cleanup(); }
+  }
+});
+
+test("state: multi-file verification cannot hide one abandoned child", async () => {
+  const s = sandbox();
+  try {
+    s.write("met.md", "# Gates\n\n- [x] G1: complete\n  EVIDENCE: checked by test\n");
+    s.write("abandoned.md", "# Gates\n\n- [ ] G1: impossible\n  EVIDENCE: pending\n\nABANDON: G1 upstream removed\n");
+    const r = await run(GATE_CHECK, ["--status", "met.md", "abandoned.md"], { cwd: s.dir });
+    assert(r.code === 1, "expected exit 1, got " + r.code + "\n" + r.out);
+    assertHas(r.out, "HANDOFF REQUIRED: 1 abandoned");
+    assertHas(r.out, "abandoned:G1");
+    assertLacks(r.out, "ALL MET");
+  } finally { s.cleanup(); }
+});
+
+test("hierarchy: an abandoned child cannot promote its N1 parent", async () => {
+  const s = sandbox();
+  try {
+    const child = s.write("child.md", "# Gates\n\n- [ ] G1: impossible\n  EVIDENCE: pending\n\nABANDON: G1 upstream removed\n");
+    s.write("parent-oracle.mjs", [
+      "import { spawnSync } from 'node:child_process';",
+      "const result = spawnSync(process.execPath, [" + JSON.stringify(GATE_CHECK) + ", '--reverify', " + JSON.stringify(child) + "], { encoding: 'utf8', env: process.env });",
+      "process.stdout.write((result.stdout || '') + (result.stderr || ''));",
+      "process.exit(result.status === 0 ? 0 : 1);",
+      "",
+    ].join("\n"));
+    s.write("parent.md", "# Gates: parent\n\n" + gate("N1", "child is complete", "node parent-oracle.mjs", "ALL MET"));
+    const r = await run(GATE_CHECK, ["parent.md"], { cwd: s.dir });
+    assert(r.code === 1, "parent unexpectedly passed\n" + r.out);
+    assertHas(r.out, "FAIL parent:N1");
+    assertHas(r.out, "HANDOFF REQUIRED");
+    assertLacks(r.out, "PASS parent:N1");
+    assertHas(s.read("parent.md"), "- [ ] N1");
   } finally { s.cleanup(); }
 });
 
@@ -304,6 +363,134 @@ test("hook: blocks on its own scope, naming qualified ids", async () => {
   } finally { s.cleanup(); }
 });
 
+test("hook: stale definition evidence blocks repeated ids without executing and keeps semantic progress", async () => {
+  const s = sandbox();
+  try {
+    s.write("a.mjs", [
+      "import { appendFileSync } from 'node:fs';",
+      "appendFileSync('runs-a.log', 'run\\n');",
+      "console.log('A-OK');",
+      "",
+    ].join("\n"));
+    s.write("b.mjs", [
+      "import { appendFileSync } from 'node:fs';",
+      "appendFileSync('runs-b.log', 'run\\n');",
+      "console.log('B-OK');",
+      "",
+    ].join("\n"));
+    s.write(".unlazy/api/gates/leaf-current.md", "# Gates\n\n" +
+      gate("G1", "current automatic evidence", "node a.mjs", "A-OK"));
+    s.write(".unlazy/api/gates/leaf-stale.md", "# Gates\n\n" +
+      gate("G1", "stale automatic evidence", "node b.mjs", "B-OK"));
+    const seed = await run(GATE_CHECK, ["--scope", "api"], { cwd: s.dir });
+    assert(seed.code === 0, seed.out);
+
+    const currentBefore = s.read(".unlazy/api/gates/leaf-current.md");
+    const staleBefore = s.read(".unlazy/api/gates/leaf-stale.md");
+    s.write(".unlazy/api/gates/leaf-stale.md",
+      staleBefore.replace("CHECK: node b.mjs", "CHECK: node ./b.mjs"));
+    const staleBytes = s.read(".unlazy/api/gates/leaf-stale.md");
+    const runsA = s.read("runs-a.log");
+    const runsB = s.read("runs-b.log");
+
+    const status = await run(GATE_CHECK, ["--scope", "api", "--status"], { cwd: s.dir });
+    assert(status.code === 1, "stale multi-file status returned " + status.code + "\n" + status.out);
+    assertHas(status.out, "UNMET leaf-stale:G1 (checked but automatic evidence is stale or unbound)");
+    assertLacks(status.out, "UNMET leaf-current:G1", "multi-file status");
+    assertLacks(status.out, "ALL MET", "multi-file status");
+    assert(s.read(".unlazy/api/gates/leaf-current.md") === currentBefore,
+      "status changed current sibling ledger");
+    assert(s.read(".unlazy/api/gates/leaf-stale.md") === staleBytes,
+      "status changed stale ledger");
+
+    const stdin = JSON.stringify({ cwd: s.dir, session_id: "stale-definition-hook" });
+    const firstHook = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
+    assertHas(firstHook.out, '"decision":"block"');
+    assertHas(firstHook.out, "leaf-stale:G1");
+    assertLacks(firstHook.out, "leaf-current:G1", "Stop reason");
+    assertLacks(firstHook.out, "definition-sha256", "privileged Stop reason");
+    assert(s.read("runs-a.log") === runsA && s.read("runs-b.log") === runsB,
+      "status or Stop executed a CHECK");
+
+    // Another CHECK edit leaves the same semantic stale-unmet state and must
+    // increment, not reset, the six-block no-progress guard.
+    s.write(".unlazy/api/gates/leaf-stale.md",
+      staleBytes.replace("CHECK: node ./b.mjs", "CHECK: node ././b.mjs"));
+    const secondHook = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
+    assertHas(secondHook.out, '"decision":"block"');
+    const hookState = JSON.parse(s.read(".unlazy/api/hook-state.json"));
+    assert(Object.values(hookState.sessions)[0].blocks === 2,
+      "stale definition edit reset semantic progress: " + JSON.stringify(hookState));
+
+    const repaired = await run(GATE_CHECK, ["--scope", "api"], { cwd: s.dir });
+    assert(repaired.code === 0, repaired.out);
+    assertHas(repaired.out, "PASS leaf-stale:G1");
+    const allowed = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
+    assertLacks(allowed.out, '"decision":"block"', "repaired Stop hook");
+    assert(!existsSync(join(s.dir, ".unlazy", "api", "hook-state.json")),
+      "completed scope retained stale hook progress state");
+  } finally { s.cleanup(); }
+});
+
+test("hook: a matching digest with a malformed success transcript stays unmet", async () => {
+  const s = sandbox();
+  try {
+    s.write("check.mjs", [
+      "import { appendFileSync } from 'node:fs';",
+      "appendFileSync('runs.log', 'run\\n');",
+      "console.log('OK');",
+      "",
+    ].join("\n"));
+    const file = ".unlazy/api/gates/leaf.md";
+    s.write(file, "# Gates\n\n" + gate("G1", "canonical automatic success", "node check.mjs", "OK"));
+    const seed = await run(GATE_CHECK, ["--scope", "api"], { cwd: s.dir });
+    assert(seed.code === 0, seed.out);
+    const current = s.read(file);
+    const digest = (current.match(/definition-sha256=([a-f0-9]{64});/) || [])[1];
+    assert(digest, "seed evidence lacks a definition digest\n" + current);
+    s.write(file, current.replace(/EVIDENCE: .*$/m,
+      "EVIDENCE: automatic-evidence=v1; definition-sha256=" + digest +
+      "; exit=1; EXPECT=not matched; output-sha256=" + "a".repeat(64) + "; output-bytes=0;"));
+    const malformed = s.read(file);
+    const runs = s.read("runs.log");
+
+    const status = await run(GATE_CHECK, ["--scope", "api", "--status"], { cwd: s.dir });
+    assert(status.code === 1, "malformed automatic transcript passed status\n" + status.out);
+    assertHas(status.out, "checked but automatic evidence is stale or unbound");
+    assert(s.read(file) === malformed, "status rewrote malformed automatic evidence");
+    const hook = await run(STOP_HOOK, ["--scope", "api"], {
+      cwd: s.dir,
+      stdin: JSON.stringify({ cwd: s.dir, session_id: "malformed-auto-hook" }),
+    });
+    assertHas(hook.out, '"decision":"block"');
+    assertHas(hook.out, "leaf:G1");
+    assert(s.read("runs.log") === runs, "status or Stop executed malformed automatic evidence");
+  } finally { s.cleanup(); }
+});
+
+test("hook: abandonment allows Stop but reports an explicit bounded handoff", async () => {
+  const s = sandbox();
+  try {
+    s.write(".unlazy/api/gates/leaf-7.md", [
+      "# Gates",
+      "",
+      "- [ ] G3: impossible",
+      "  EVIDENCE: pending",
+      "",
+      "ABANDON: G3 secret-looking reason that must stay ledger-local",
+      "",
+    ].join("\n"));
+    const r = await run(STOP_HOOK, ["--scope", "api"], {
+      cwd: s.dir,
+      stdin: JSON.stringify({ cwd: s.dir, session_id: "handoff-test" }),
+    });
+    assertLacks(r.out, '"decision":"block"');
+    assertHas(r.out, "HANDOFF REQUIRED");
+    assertHas(r.out, "leaf-7:G3");
+    assertLacks(r.out, "secret-looking reason");
+  } finally { s.cleanup(); }
+});
+
 test("hook: unresolvable scope allows the stop instead of blocking blindly", async () => {
   const s = sandbox();
   try {
@@ -343,6 +530,43 @@ test("hook: each pipeline keeps its own loop-guard counter", async () => {
     assertHas(apiNow.out, "releasing after 6 blocks");
     const webNow = await run(STOP_HOOK, ["--scope", "web"], { cwd: s.dir, stdin });
     assertHas(webNow.out, '"decision":"block"');
+  } finally { s.cleanup(); }
+});
+
+test("hook: the loop guard tracks gate state, not file bytes", async () => {
+  const s = sandbox();
+  try {
+    // A cosmetic edit is not progress. Keying the guard to raw bytes let any
+    // touch of the ledger reset the counter, so an agent that keeps editing
+    // without meeting a gate is never released. Re-running the checker did the
+    // same thing by rewriting evidence text.
+    s.write(".unlazy/api/gates/leaf-1.md", "# Gates\n\n" + gate("G1", "a", null, null) + gate("G2", "b", null, null));
+    const stdin = JSON.stringify({ cwd: s.dir });
+    for (let i = 0; i < 6; i++) {
+      const blocked = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
+      assertHas(blocked.out, '"decision":"block"');
+    }
+    s.write(".unlazy/api/gates/leaf-1.md",
+      s.read(".unlazy/api/gates/leaf-1.md") + "\n<!-- still thinking about it -->\n");
+    const afterCosmetic = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
+    assertHas(afterCosmetic.out, "releasing after 6 blocks");
+  } finally { s.cleanup(); }
+});
+
+test("hook: meeting a gate resets the loop guard", async () => {
+  const s = sandbox();
+  try {
+    // The converse of the test above: real progress must still rearm the guard,
+    // or a long run would be released while it is genuinely advancing.
+    s.write(".unlazy/api/gates/leaf-1.md", "# Gates\n\n" + gate("G1", "a", null, null) + gate("G2", "b", null, null));
+    const stdin = JSON.stringify({ cwd: s.dir });
+    for (let i = 0; i < 3; i++) await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
+    s.write(".unlazy/api/gates/leaf-1.md",
+      "# Gates\n\n- [x] G1: a\n  EVIDENCE: measured 3 of 3\n\n" + gate("G2", "b", null, null));
+    for (let i = 0; i < 4; i++) {
+      const blocked = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
+      assertHas(blocked.out, '"decision":"block"');
+    }
   } finally { s.cleanup(); }
 });
 

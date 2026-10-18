@@ -37,9 +37,11 @@ The fenced example above is documentation. Lines inside fenced code blocks are i
 - Give a runnable gate both `CHECK:` and `EXPECT:`. Give a manual gate neither. A partial runnable gate is malformed.
 - Use one `EVIDENCE:` line per gate. If it is omitted from an otherwise valid gate, the checker inserts it without changing the file's original CRLF or LF newline style.
 - Put the optional `OWNS:` header before the first gate. Separate paths with commas. Paths are repository-relative globs; absolute paths and traversal segments such as `..` are invalid.
-- Write `ABANDON: <id> <reason>` only for a gate in the same file. The reason must contain non-whitespace text. An unknown id is warned and resolves no live gate.
+- Write `ABANDON: <id> <reason>` only for a gate in the same file. The reason must contain non-whitespace text. An unknown id is a parse error, because silently ignoring a typo could let an otherwise green child promote its parent.
+- Start `ABANDON:` at column 1. It names its gate by id, so it is a file-level statement rather than a gate attribute, and it is the one line that must not be indented. An indented `ABANDON:` is diagnosed rather than applied.
 - Do not define a ledger with zero gates. A named empty or malformed ledger is a parse error, not `ALL MET`.
 - Use `/pattern/flags` for a JavaScript regular-expression expectation or plain text for a substring. An invalid regular expression is a parse error.
+- Remember that the wrapping slashes always win. `EXPECT: /etc/app/conf/` is the pattern `etc/app/conf`, not that literal path, so its dots match any character. An unescaped inner slash is warned because both readings are plausible. Escape the inner slashes to keep the pattern, or drop the wrapping slashes and match a distinctive substring such as `etc/app/conf`.
 
 Ids are unique within one file. Tools qualify them with the file stem in tree-wide output, such as `leaf-1.2.1:G3` or `node-1.1:N2`. Use the qualified form in reports and handoffs.
 
@@ -50,17 +52,19 @@ A runnable gate passes only when both conditions hold:
 1. The process starts and exits with status `0`.
 2. `EXPECT:` matches the command's combined standard output and standard error.
 
-A nonzero process never passes merely because its error text contains the expected token. A timeout, shell-start error, missing command, or output-limit failure also fails. The default timeout is 120 seconds; `--timeout` accepts an integer from 1 through 86400. Each check is capped at 1 MiB of combined output, and regular-expression matching is capped at 250 milliseconds in a disposable worker.
+A nonzero process never passes merely because its error text contains the expected token. A timeout, shell-start error, missing command, or output-limit failure also fails. The default timeout is 120 seconds; `--timeout` accepts an integer from 1 through 86400. Cleanup and checker settlement are bounded, but a deliberately detached process may outlive its timed-out shell because unlazy is not a process sandbox; checks must clean up any background services they intentionally detach. Each check has two 1 MiB ceilings: first on the total raw stdout/stderr payload captured, then on the UTF-8 byte length of the canonical matcher string. That string is all captured stdout decoded as UTF-8, one synthetic newline when both streams are nonempty, then all captured stderr decoded as UTF-8. `EXPECT:` and the evidence SHA-256/byte count use that exact string. Invalid byte replacement or the stream separator can make the second representation larger than the raw payload; it fails as overflow and is never truncated into a match. Regular-expression matching uses at most four disposable workers; each gets a five-second startup limit before its separate 250ms match budget begins.
 
-Evidence records the resolved shell, resolved working directory, exit status, a short `PATH` hash and entry count, and capped decisive output. The pre-execution transcript prints the resolved `PATH`, capped at 800 characters for display; evidence avoids persisting the full machine-specific value. This makes an environment mismatch visible and prevents a success token from hiding a process failure. A checked gate whose evidence is absent or still `pending` remains unmet.
+Automatic evidence begins with `automatic-evidence=v1` and a full lowercase SHA-256 digest of the parsed `CHECK:`, `EXPECT:`, and raw `CWD:` definition. The digest is environment-independent and excludes the gate id/title, formatting, ledger path, resolved paths, shell, timeout, platform, and `PATH`. The canonical `exit=0`, `EXPECT=matched`, successful-output-string digest, and its UTF-8 byte count immediately follow and are validated before capped machine-specific transcript fields; only that later transcript is opaque. Truncation therefore cannot remove either deciding fingerprint. Raw successful output and the full `PATH` are not persisted. Failure diagnostics are bounded, terminal-only, and control-stripped.
 
-`--status` parses and reports without executing a command or changing a file. It does not revalidate old evidence. Use `--reverify` for parent verification: it executes every runnable gate, including gates already checked, and returns a gate to unmet when the oracle no longer passes. Its summary reports both all commands rerun and the subset that had previously been met.
+A checked runnable gate is met only when that exact v1 definition binding and canonical success/output header are present. Missing, blank, `pending`, ordinary prose, pre-v1, malformed, future-version, or mismatched runnable evidence is `stale-unmet`; a normal run schedules it for the usual approval lookup and a successful run migrates it. The digest is unkeyed structural drift detection, not authenticity or tamper proof: a ledger editor can forge a syntactically canonical matching header. A failed stale rerun clears the box and restores `EVIDENCE: pending`. Manual gates keep ordinary historical human evidence, but reserved v1 evidence and the legacy `exit=0; shell=` transcript stay machine evidence if a runnable gate becomes manual. Conversely, adding a runnable definition to a human-attested manual gate makes that old evidence stale.
+
+`--status` parses and reports ledger state without executing a command or changing a file. It validates the pure definition binding without resolving a shell, reading approval storage, or depending on `PATH`, timeout, or other runtime options. The Stop hook uses the same non-executing state model. Neither mode inspects current artifacts or transitive inputs. Use `--reverify` for parent verification: it executes every runnable gate, including gates already checked, and returns a gate to unmet when the oracle no longer passes. Its summary reports both all commands rerun and the subset that had previously been met.
 
 ## Approval boundary
 
 `CHECK:` is executable shell code with the permissions and inherited environment of the checker. Parse inherited ledgers with `--status` and read their source. A normal run without an existing approval prints each resolved oracle and leaves it unexecuted. Execute only with explicit `--approve` after reviewing every command and called script.
 
-Approval records live under `~/.unlazy/approved` by default. `UNLAZY_APPROVAL_DIR` can select another real directory, but it must remain outside the repository root. The approval identity includes the absolute ledger and gate, exact `CHECK:` and `EXPECT:`, resolved `CWD:` and shell, timeout, output and regex limits, platform, and full inherited `PATH`. Changing any bound input invalidates approval. Approval does not hash scripts or other files reached transitively by a shell command, so re-review those dependencies after they change even when the command text stays fixed. Approval confirms that a command may run; it does not prove that the command measures the English outcome. See [../SECURITY.md](../SECURITY.md) for the full threat model.
+Approval records live under `~/.unlazy/approved` by default. `UNLAZY_APPROVAL_DIR` can select another directory only when it is a real, owner-private directory whose canonical target stays outside the canonical repository root. Symlinked stores and linked, replaced, or non-private records fail closed. The approval identity includes the absolute ledger and gate, exact `CHECK:` and `EXPECT:`, resolved `CWD:` and shell, timeout, output and regex limits, regex worker limits, platform, and full inherited `PATH`. It is deliberately separate from the environment-independent evidence digest: approval decides whether this runtime oracle may execute, while the definition digest decides whether recorded automatic evidence describes the current parsed definition. Changing any approval-bound input invalidates approval. Approval deliberately does not hash called scripts, fixtures, source files, dependencies, or other transitive inputs. A byte change to those files can therefore run under an existing approval, and structurally current evidence can remain visible until explicit re-verification. Reinspect changed dependencies and run `--reverify`. If machine-enforced dependency identity is required, put expected digests in approval-bound `CHECK:` text and validate them with a separately trusted tool/runtime; that is user-designed coverage, not transitive tracing by unlazy. Approval confirms that a command may run; it does not prove that the command measures the English outcome. See [../SECURITY.md](../SECURITY.md) for the full threat model.
 
 ## Shell, PATH, and working directory
 
@@ -97,11 +101,48 @@ The checker validates a declared oracle. It cannot infer whether unrestricted En
 - **Test negative controls.** Before trusting an absence check, run the same logic against a known positive fixture and confirm that it fails. A missing file, wrong path, or malformed pattern can otherwise look like valid absence.
 - **Measure supplied numbers independently.** Do not make a number copied from the brief its own expectation. Make the script calculate the value from source data, apply the acceptance rule, and print a separate success marker.
 - **Review consequential manual gates by risk.** A contributor's single 17-gate course audit found that its only manual gate was also its most consequential. Use that observation as a prompt for stronger review, not as evidence of a general correlation between checkability and risk. Cite exact evidence and obtain a second review when the consequence warrants it.
-- **Keep evidence decisive.** Record the smallest output that proves the outcome. Do not paste full logs into a ledger.
+- **Keep evidence decisive.** Automated successful evidence stores an output fingerprint, not raw output. For manual gates, record the smallest non-sensitive fact that proves the outcome; do not paste full logs into a ledger.
+
+### Lint the ledger before working it
+
+The rules above are prose, and prose is the layer this project already treats as weakest. `gate-lint.mjs` makes the mechanical subset of them checkable. It never executes a `CHECK:`; it reads the ledger and judges its oracles.
+
+```text
+node scripts/gate-lint.mjs GATES.md
+node scripts/gate-lint.mjs --strict --json .unlazy/<scope>/gates/leaf-1.1.1.md
+```
+
+Warnings are deliberately advisory lexical signals: a whole command that looks like a fixed-output emitter, an expectation drawn from vocabulary that failure output also uses, a slash-wrapped path-shaped regular expression, a title that names an activity rather than an outcome, a number that nothing measures, or a mostly manual ledger. The linter does not shell-parse commands, and neither a command prefix nor EXPECT text appearing in argv proves that an oracle cannot fail.
+
+Default warnings print details plus `LINT OK (<N> warning(s))` and exit `0`, so the self-gate below remains useful without making every advisory fatal. `--strict` prints `LINT FINDINGS`, exits `1`, and emits no `LINT OK` marker. Exit `2` is a usage or shared-parser failure. A lint finding is a prompt to sharpen the gate, not proof that the outcome is wrong.
+
+Make a ledger require its own quality by linting as a gate:
+
+```markdown
+- [ ] G0: this ledger states outcomes that can fail
+  CHECK: node scripts/gate-lint.mjs GATES.md
+  EXPECT: LINT OK
+  EVIDENCE: pending
+```
 
 ## Abandonment
 
-Use abandonment only when a required outcome is genuinely impossible within the authorized task. Keep the original gate, add one non-empty reason, and name the abandonment in the final report. An abandonment is a visible handoff, not a passing check. If an entire requested deliverable is abandoned, do not describe the task as fully complete.
+Use abandonment only when a required outcome is genuinely impossible within the authorized task. Keep the original gate, add one non-empty reason, and name the abandonment in the final report. An abandonment is a terminal visible handoff, not a passing check: `gate-check` prints `HANDOFF REQUIRED` and exits `1` even when every non-abandoned gate is met. The Stop hook allows the session to end but emits a bounded handoff message containing qualified ids, not free-form reasons. Never promote an abandoned child through a parent `ALL MET` oracle or describe the task as fully complete.
+
+## Leaf gates versus branch gates
+
+Place a gate where its evidence lives. A leaf ledger proves one leaf, so give it
+only gates that read that leaf's own artifact and that its declared `OWNS:` paths
+can satisfy alone. A parent re-verifies a returned leaf by naming its exact
+ledger; a whole-project check smuggled into a leaf therefore makes every per-leaf
+`--reverify` re-run the entire tree instead of the one leaf that returned.
+
+Cross-cutting outcomes belong in the branch ledger, where they run once after all
+named children return: interface compatibility, end-to-end behavior, and
+regression across the joined work. `templates/gates-node.md` reserves `N1`
+through `N6` for exactly these. A regression or end-to-end gate duplicated in
+each leaf is both slower and weaker evidence than the single branch gate that
+observes the composed result.
 
 ## Concurrency
 
